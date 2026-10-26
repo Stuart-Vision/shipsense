@@ -1,0 +1,22 @@
+name: shipsense
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shipsense
+      POSTGRES_PASSWORD: shipsense
+      POSTGRES_DB: shipsense
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shipsense"]
+      interval: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgresql://shipsense:shipsense@postgres:5432/shipsense
+    ports: ["8000:8000"]

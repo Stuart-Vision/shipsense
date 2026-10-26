@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: ShipSense ingestion - raw sensor files uploaded to S3 are processed by Lambda into PostgreSQL (RDS)
+
+Parameters:
+  DatabaseSecretArn:
+    Type: String
+    Description: Secrets Manager secret holding the PostgreSQL connection string (key "url")
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets that can reach the RDS instance
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group allowed to connect to RDS on 5432
+
+Resources:
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-raw-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-raw-files
+            Status: Enabled
+            Transitions:
+              - { StorageClass: GLACIER_IR, TransitionInDays: 30 }
+
+  FailedEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days to investigate and replay
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: shipsense.lambda_handler.handler
+      Runtime: python3.13
+      Architectures: [arm64]
+      MemorySize: 1024   # pandas works on whole files in memory
+      Timeout: 300
+      Environment:
+        Variables:
+          DATABASE_SECRET_ARN: !Ref DatabaseSecretArn
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds: [!Ref SecurityGroupId]
+      Policies:
+        - S3ReadPolicy: { BucketName: !Sub '${AWS::StackName}-raw-${AWS::AccountId}' }
+        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref DatabaseSecretArn }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt FailedEventsQueue.QueueName }
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt FailedEventsQueue.Arn
+      Events:
+        RawUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref RawBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules: [{ Name: prefix, Value: raw/ }]
+
+Outputs:
+  RawBucketName:
+    Value: !Ref RawBucket
+  FailedEventsQueueUrl:
+    Value: !Ref FailedEventsQueue
